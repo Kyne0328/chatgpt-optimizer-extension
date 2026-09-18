@@ -5,10 +5,10 @@ const DEFAULT_PREFS = {
   hideNotifications: false,
   // Performance features — curated safe defaults.
   perfResourceHints: true,
-  perfReduceAnim: true,
-  perfOptimizeDom: true,
-  perfFontSwap: true,
-  perfLazyImg: true,
+  perfReduceAnim: false,
+  perfOptimizeDom: false,
+  perfFontSwap: false,
+  perfLazyImg: false,
   perfBlockTrackers: false,
   perfKeepSession: false,
   perfDeferScripts: false,
@@ -23,6 +23,14 @@ const DEFAULT_PREFS = {
   // reconcileTrackerBlocking(): it needs the optional tracker host permissions,
   // so it is never written through SET_PREFS (see the message router).
   blockTrackersNet: false
+};
+
+const PREF_SCHEMA_VERSION = 2;
+const PERFORMANCE_SAFETY_MIGRATION = {
+  perfReduceAnim: false,
+  perfOptimizeDom: false,
+  perfFontSwap: false,
+  perfLazyImg: false
 };
 
 // --- Content Script Communication ---
@@ -48,26 +56,42 @@ async function queryContentScript(action) {
   return chrome.tabs.sendMessage(tabs[0].id, { action });
 }
 
-// --- Install Handler ---
+// --- Install / preference migration ---
 
-// Use startup event instead of onInstalled to avoid race conditions
-// with unpacked extension reloads
+async function ensurePreferences() {
+  const data = await chrome.storage.local.get([
+    'installedAt', 'prefSchemaVersion', ...Object.keys(DEFAULT_PREFS)
+  ]);
+
+  if (!data.installedAt) {
+    await chrome.storage.local.set({
+      installedAt: Date.now(),
+      prefSchemaVersion: PREF_SCHEMA_VERSION,
+      ...DEFAULT_PREFS
+    });
+    return;
+  }
+
+  const schema = Number(data.prefSchemaVersion || 0);
+  if (schema < PREF_SCHEMA_VERSION) {
+    // Earlier releases enabled page-wide rendering tweaks by default. Disable
+    // them once for existing installations so the safe defaults take effect in
+    // the persisted configuration, not only in content-script fallbacks.
+    const migrated = {
+      prefSchemaVersion: PREF_SCHEMA_VERSION,
+      ...PERFORMANCE_SAFETY_MIGRATION
+    };
+    await chrome.storage.local.set(migrated);
+    await notifyContentScript(PERFORMANCE_SAFETY_MIGRATION);
+  }
+}
+
 chrome.runtime.onStartup.addListener(() => {
-  // Dynamic rules survive restarts; make sure they still match the pref + perms.
+  ensurePreferences().catch(() => {});
   reconcileTrackerBlocking();
 });
 
-// Only set defaults if truly first install (no installedAt exists)
-(async () => {
-  const data = await chrome.storage.local.get(['installedAt']);
-  if (!data.installedAt) {
-    console.log('[Rel.AI Companion] First install, setting defaults');
-    await chrome.storage.local.set({
-      installedAt: Date.now(),
-      ...DEFAULT_PREFS
-    });
-  }
-})();
+ensurePreferences().catch(() => {});
 
 // --- Network Tracker Blocking (declarativeNetRequestWithHostAccess) ---
 //
@@ -389,7 +413,38 @@ chrome.permissions.onRemoved.addListener(() => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
+  ensurePreferences().catch(() => {});
   reconcileTrackerBlocking();
+});
+
+// --- Frozen-tab rescue ---
+
+function isChatGptUrl(url) {
+  return /^https:\/\/(chatgpt\.com|chat\.openai\.com)\//.test(url || '');
+}
+
+async function rescueChat(tabHint = null) {
+  let tab = tabHint && isChatGptUrl(tabHint.url) ? tabHint : null;
+  if (!tab) {
+    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (active && isChatGptUrl(active.url)) tab = active;
+  }
+  if (!tab) {
+    const tabs = await chrome.tabs.query({ url: ['https://chatgpt.com/*', 'https://chat.openai.com/*'] });
+    tab = tabs[0] || null;
+  }
+  if (!tab || !tab.url) return { success: false, error: 'no_chatgpt_tab' };
+
+  const created = await chrome.tabs.create({
+    url: tab.url,
+    active: true,
+    index: typeof tab.index === 'number' ? tab.index + 1 : undefined
+  });
+  return { success: !!created?.id, tabId: created?.id || null };
+}
+
+chrome.commands.onCommand.addListener((command, tab) => {
+  if (command === 'rescue-chat') rescueChat(tab).catch(() => {});
 });
 
 // --- Message Router ---
@@ -425,6 +480,10 @@ async function handleMessage(msg) {
 
     case 'GET_STATS': {
       return queryContentScript('GET_STATS');
+    }
+
+    case 'RESCUE_CHAT': {
+      return rescueChat();
     }
 
     case 'SET_TRACKER_BLOCKING': {

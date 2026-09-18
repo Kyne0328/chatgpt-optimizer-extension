@@ -22,6 +22,10 @@
   const TURN_SELECTOR = '[data-testid^="conversation-turn-"]';
   const NOTIFICATION_STYLE_ID = 'relai-notification-hide-style';
   const VISIBILITY_STYLE_ID = 'relai-visibility-style';
+  const GENERATION_SELECTOR = '[data-testid="stop-button"],button[aria-label*="Stop" i],.result-streaming';
+  let generationBusy = false;
+  let generationPollTimer = null;
+  let generationSettleTimer = null;
 
   // ── i18n ──────────────────────────────────────────────────────────
   // Language is shared with popup via chrome.storage.local under "uiLang".
@@ -61,6 +65,46 @@
 
   function getTurns() {
     return document.querySelectorAll(TURN_SELECTOR);
+  }
+
+  function notifyTurnStructureChanged() {
+    document.dispatchEvent(new CustomEvent('relai-turns-changed'));
+  }
+
+  function setGenerationBusy(next) {
+    if (next) {
+      if (generationSettleTimer) { clearTimeout(generationSettleTimer); generationSettleTimer = null; }
+      if (generationBusy) return;
+      generationBusy = true;
+      document.documentElement.setAttribute('data-relai-generating', '1');
+      document.dispatchEvent(new CustomEvent('relai-generation-start'));
+      return;
+    }
+    if (!generationBusy || generationSettleTimer) return;
+    generationSettleTimer = setTimeout(() => {
+      generationSettleTimer = null;
+      generationBusy = false;
+      document.documentElement.removeAttribute('data-relai-generating');
+      document.dispatchEvent(new CustomEvent('relai-generation-end'));
+      refreshNavigator();
+      if (toolScanNeeded()) runToolScan();
+    }, 1200);
+  }
+
+  function updateGenerationState() {
+    setGenerationBusy(!!document.querySelector(GENERATION_SELECTOR));
+  }
+
+  function startGenerationMonitor() {
+    if (generationPollTimer) return;
+    updateGenerationState();
+    generationPollTimer = setInterval(updateGenerationState, 900);
+    window.addEventListener('pagehide', () => {
+      if (generationPollTimer) clearInterval(generationPollTimer);
+      generationPollTimer = null;
+      if (generationSettleTimer) clearTimeout(generationSettleTimer);
+      generationSettleTimer = null;
+    }, { once: true });
   }
 
   // ── Visibility via Dynamic Style Tag ──────────────────────────────
@@ -122,6 +166,8 @@
             const added = newTotal - totalTurns;
             totalTurns = newTotal;
             applyVisibility();
+            notifyTurnStructureChanged();
+            if (!generationBusy) refreshNavigator();
             log('New messages detected:', added, '→ total:', totalTurns);
           }
         }, 800);
@@ -307,9 +353,9 @@
 
   const PERF_DEFAULTS = {
     perfResourceHints: true,
-    perfReduceAnim: true,
+    perfReduceAnim: false,
     perfOptimizeDom: false,
-    perfFontSwap: true,
+    perfFontSwap: false,
     perfLazyImg: false,
     perfBlockTrackers: false,
     perfKeepSession: false,
@@ -1376,8 +1422,7 @@
     if (newMsgObs) { newMsgObs.disconnect(); newMsgObs = null; }
     // Clear the visibility tag (turns render normally without it now)
     ensureStyleTag().textContent = '';
-    // Detach the Navigator scroll listener bound to the old chat's scroller; it
-    // re-attaches on the next init via onChatReady().
+    // Disconnect the Navigator IntersectionObserver bound to the old chat.
     detachNavScroll();
     // Drop accumulated Hide-Thinking uuids — the next chat has different ones.
     resetHideThinkingForNewChat();
@@ -1437,8 +1482,9 @@
     // Preserve ChatGPT's native long-conversation virtualization.
     applyVisibility();
 
-    // Rebind per-chat listeners for tools (Navigator scroll, scans).
+    // Rebind per-chat listeners for tools.
     onChatReady();
+    notifyTurnStructureChanged();
 
     return true;
   }
@@ -1534,32 +1580,30 @@
   }
 
   // ── Shared feature-scan observer ──────────────────────────────────
-  // A SINGLE MutationObserver drives every DOM-scanning tool (Navigator refresh,
-  // Hide Thinking and Manual Images) so we never stack up one
-  // observer per feature. Passes are debounced (1s) with a 3s starvation cap so
-  // continuous streaming mutations can't starve a scan forever.
+  // Only opt-in tools that genuinely inspect turn descendants participate.
+  // Navigator is driven by turn-structure events + IntersectionObserver.
   let toolScanObs = null;
   let toolScanDebounce = null;
   let toolScanLastRun = 0;
 
   function toolScanNeeded() {
-    return toolActive.navigator || toolActive.hideThinking || toolActive.clickToLoadImg;
+    return toolActive.hideThinking || toolActive.clickToLoadImg;
   }
   function scheduleToolScan() {
+    if (generationBusy) return;
     clearTimeout(toolScanDebounce);
     const wait = (Date.now() - toolScanLastRun) > 3000 ? 0 : 1000;
     toolScanDebounce = setTimeout(runToolScan, wait);
   }
   function runToolScan() {
+    if (generationBusy) return;
     toolScanLastRun = Date.now();
-    if (toolActive.navigator) refreshNavigator();
     if (toolActive.hideThinking) scanHideThinking();
     if (toolActive.clickToLoadImg) scanClickToLoadImg();
   }
   function mutationAffectsToolScan(mutations) {
-    const needsDeepTurnChanges = toolActive.hideThinking || toolActive.clickToLoadImg;
     for (const m of mutations) {
-      if (needsDeepTurnChanges && m.target?.nodeType === Node.ELEMENT_NODE && m.target.closest?.(TURN_SELECTOR)) return true;
+      if (m.target?.nodeType === Node.ELEMENT_NODE && m.target.closest?.(TURN_SELECTOR)) return true;
       for (const node of [...m.addedNodes, ...m.removedNodes]) {
         if (node.nodeType !== Node.ELEMENT_NODE) continue;
         if (node.matches?.(TURN_SELECTOR) || node.querySelector?.(TURN_SELECTOR)) return true;
@@ -1573,9 +1617,10 @@
         toolScanObs = new MutationObserver((mutations) => {
           if (mutationAffectsToolScan(mutations)) scheduleToolScan();
         });
-        toolScanObs.observe(document.body || document.documentElement, { childList: true, subtree: true });
+        const target = chatContainer || document.querySelector('main');
+        if (target) toolScanObs.observe(target, { childList: true, subtree: true });
       }
-      runToolScan(); // immediate pass so toggling takes effect at once
+      runToolScan();
     } else if (toolScanObs) {
       toolScanObs.disconnect();
       toolScanObs = null;
@@ -1583,7 +1628,6 @@
     }
   }
 
-  // Orchestrator — apply each tool from its stored preference.
   function applyToolFeatures() {
     const eff = (key) => toolPrefs[key];
     applyNavigator(eff('navigatorEnabled'));
@@ -1591,26 +1635,26 @@
     applyHideThinking(eff('hideThinking'));
     applyClickToLoadImg(eff('clickToLoadImg'));
     applyPrefetch(eff('prefetchNav'));
-    // cleanMemorySmart has no widget — interceptChatLinks reads it live.
     updateToolScanObserver();
   }
 
-  // A fresh chat just mounted (called from init) — rebind per-chat listeners
-  // and run one scan against the new DOM.
   function onChatReady() {
-    if (toolActive.navigator) { attachNavScroll(); refreshNavigator(); }
-    if (toolScanNeeded()) runToolScan();
+    if (toolActive.navigator) refreshNavigator();
+    if (toolScanNeeded()) {
+      if (toolScanObs) { toolScanObs.disconnect(); toolScanObs = null; }
+      updateToolScanObserver();
+    }
   }
 
   // ── Conversation Navigator ────────────────────────────────────────
   let navWidget = null;
-  let navScrollHandler = null;
-  let navScrollTarget = null;
-  let navScrollThrottle = null;
+  let navIntersectionObs = null;
+  let navUsers = [];
+  let navIndexByWrapper = new WeakMap();
+  let navCurrentIndex = 0;
   let navDragging = false;
 
   function getUserTurns() {
-    // data-turn="user" persists on the <section> even when virtualized.
     return Array.from(document.querySelectorAll(TURN_SELECTOR + '[data-turn="user"]'));
   }
 
@@ -1636,11 +1680,21 @@
     navWidget.addEventListener('pointercancel', onNavPointerUp);
     navWidget.addEventListener('keydown', onNavKeyDown);
     (document.body || document.documentElement).appendChild(navWidget);
+    document.dispatchEvent(new CustomEvent('relai-nav-mounted'));
   }
+
+  function detachNavScroll() {
+    if (navIntersectionObs) { navIntersectionObs.disconnect(); navIntersectionObs = null; }
+    navUsers = [];
+    navIndexByWrapper = new WeakMap();
+  }
+
   function removeNavigator() {
     navDragging = false;
+    detachNavScroll();
     if (navWidget) { navWidget.remove(); navWidget = null; }
   }
+
   function navIndexFromClientY(clientY, users) {
     if (!navWidget || !users.length) return 0;
     const track = navWidget.querySelector('.relai-nav-track');
@@ -1649,15 +1703,18 @@
     const ratio = Math.max(0, Math.min(1, (clientY - rect.top) / Math.max(1, rect.height)));
     return Math.round(ratio * (users.length - 1));
   }
-  function jumpToUserIndex(index, users) {
+
+  function jumpToUserIndex(index, users = navUsers) {
     if (!users.length) return;
     const next = Math.max(0, Math.min(users.length - 1, index));
+    navCurrentIndex = next;
     scrollToTurnWrapper(users[next]);
     setNavPosition(next, users.length);
   }
+
   function onNavPointerDown(e) {
     if (e.button !== 0) return;
-    const users = getUserTurns();
+    const users = navUsers.length ? navUsers : getUserTurns();
     if (users.length < 2) return;
     e.preventDefault();
     e.stopPropagation();
@@ -1666,22 +1723,25 @@
     try { navWidget.setPointerCapture(e.pointerId); } catch (_) {}
     jumpToUserIndex(navIndexFromClientY(e.clientY, users), users);
   }
+
   function onNavPointerMove(e) {
     if (!navDragging) return;
     e.preventDefault();
-    const users = getUserTurns();
+    const users = navUsers.length ? navUsers : getUserTurns();
     jumpToUserIndex(navIndexFromClientY(e.clientY, users), users);
   }
+
   function onNavPointerUp(e) {
     if (!navDragging) return;
     navDragging = false;
     navWidget?.classList.remove('relai-nav-dragging');
     try { navWidget?.releasePointerCapture(e.pointerId); } catch (_) {}
   }
+
   function onNavKeyDown(e) {
-    const users = getUserTurns();
+    const users = navUsers.length ? navUsers : getUserTurns();
     if (users.length < 2) return;
-    let next = currentUserIndex(users);
+    let next = navCurrentIndex;
     if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') next -= 1;
     else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') next += 1;
     else if (e.key === 'PageUp') next -= 5;
@@ -1692,74 +1752,88 @@
     e.preventDefault();
     jumpToUserIndex(next, users);
   }
+
   function scrollToTurnWrapper(turn) {
     if (!turn) return;
     getTurnWrapper(turn).scrollIntoView({ block: 'start' });
   }
-  // Index of the last user turn whose wrapper top is at/above 80px below the
-  // scroller's top edge (i.e. the one currently in view).
-  function currentUserIndex(users) {
-    const sc = scrollContainer || findScrollContainer(users[0]);
-    const scTop = sc ? sc.getBoundingClientRect().top : 0;
-    let idx = 0;
-    for (let i = 0; i < users.length; i++) {
-      const rect = getTurnWrapper(users[i]).getBoundingClientRect();
-      if (rect.top - scTop <= 80) idx = i;
-      else break;
-    }
-    return idx;
-  }
+
   function setNavPosition(index, total) {
     if (!navWidget || total < 1) return;
-    const ratio = total > 1 ? index / (total - 1) : 0;
+    const safeIndex = Math.max(0, Math.min(total - 1, index));
+    const ratio = total > 1 ? safeIndex / (total - 1) : 0;
     const pct = Math.round(ratio * 10000) / 100;
     const count = navWidget.querySelector('.relai-nav-count');
     const progress = navWidget.querySelector('.relai-nav-progress');
     const thumb = navWidget.querySelector('.relai-nav-thumb');
     if (count) {
-      count.textContent = (index + 1) + ' / ' + total;
+      count.textContent = (safeIndex + 1) + ' / ' + total;
       count.style.top = Math.max(7, Math.min(93, pct)) + '%';
     }
     if (progress) progress.style.height = pct + '%';
     if (thumb) thumb.style.top = pct + '%';
     navWidget.setAttribute('aria-valuemin', '1');
     navWidget.setAttribute('aria-valuemax', String(total));
-    navWidget.setAttribute('aria-valuenow', String(index + 1));
-    navWidget.setAttribute('aria-valuetext', (index + 1) + ' of ' + total);
+    navWidget.setAttribute('aria-valuenow', String(safeIndex + 1));
+    navWidget.setAttribute('aria-valuetext', (safeIndex + 1) + ' of ' + total);
   }
-  function refreshNavigator() {
-    if (!navWidget) return;
-    syncInjectedTheme(navWidget);
-    const users = getUserTurns();
-    if (users.length < 2) { navWidget.style.display = 'none'; return; }
-    navWidget.style.display = '';
-    setNavPosition(currentUserIndex(users), users.length);
-  }
+
   function attachNavScroll() {
-    detachNavScroll();
-    const sc = scrollContainer || findScrollContainer(getTurns()[0]);
-    if (!sc) return;
-    navScrollTarget = sc;
-    navScrollHandler = () => {
-      if (navScrollThrottle) return;
-      navScrollThrottle = setTimeout(() => {
-        navScrollThrottle = null;
-        const users = getUserTurns();
-        if (users.length >= 2) setNavPosition(currentUserIndex(users), users.length);
-      }, 250);
-    };
-    sc.addEventListener('scroll', navScrollHandler, { passive: true });
+    if (!navWidget || generationBusy) return;
+    if (navIntersectionObs) { navIntersectionObs.disconnect(); navIntersectionObs = null; }
+
+    navUsers = getUserTurns();
+    if (navUsers.length < 2) {
+      navWidget.style.display = 'none';
+      return;
+    }
+    navWidget.style.display = '';
+    navCurrentIndex = Math.max(0, Math.min(navCurrentIndex, navUsers.length - 1));
+    setNavPosition(navCurrentIndex, navUsers.length);
+
+    if (typeof IntersectionObserver !== 'function') return;
+
+    const sc = scrollContainer || findScrollContainer(navUsers[0]);
+    const docScroller = document.scrollingElement || document.documentElement;
+    const root = !sc || sc === docScroller || sc === document.documentElement || sc === document.body ? null : sc;
+    navIndexByWrapper = new WeakMap();
+
+    navIntersectionObs = new IntersectionObserver((entries) => {
+      if (generationBusy || navDragging) return;
+      let best = null;
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const index = navIndexByWrapper.get(entry.target);
+        if (typeof index !== 'number') continue;
+        const distance = Math.abs(entry.boundingClientRect.top - 80);
+        if (!best || distance < best.distance) best = { index, distance };
+      }
+      if (!best) return;
+      navCurrentIndex = best.index;
+      setNavPosition(navCurrentIndex, navUsers.length);
+    }, {
+      root,
+      rootMargin: '-72px 0px -70% 0px',
+      threshold: [0, 0.01]
+    });
+
+    navUsers.forEach((turn, index) => {
+      const wrapper = getTurnWrapper(turn);
+      navIndexByWrapper.set(wrapper, index);
+      navIntersectionObs.observe(wrapper);
+    });
   }
-  function detachNavScroll() {
-    if (navScrollTarget && navScrollHandler) navScrollTarget.removeEventListener('scroll', navScrollHandler);
-    navScrollHandler = null;
-    navScrollTarget = null;
-    if (navScrollThrottle) { clearTimeout(navScrollThrottle); navScrollThrottle = null; }
+
+  function refreshNavigator() {
+    if (!navWidget || generationBusy) return;
+    syncInjectedTheme(navWidget);
+    attachNavScroll();
   }
+
   function applyNavigator(on) {
     toolActive.navigator = on;
-    if (on) { ensureNavigator(); attachNavScroll(); refreshNavigator(); }
-    else { detachNavScroll(); removeNavigator(); }
+    if (on) { ensureNavigator(); refreshNavigator(); }
+    else removeNavigator();
   }
 
   // ── Session Stats ─────────────────────────────────────────────────
@@ -1851,7 +1925,7 @@
     const panel = sessionStatsEl.querySelector('.relai-session-popover');
     if (!panel || panel.hidden) return;
     setSessionRow('mem', mem ? (mb(mem.usedJSHeapSize) + ' / ' + mb(mem.totalJSHeapSize) + ' MB') : '', !!mem);
-    setSessionRow('nodes', String(document.getElementsByTagName('*').length));
+    setSessionRow('nodes', '—', false);
     const total = getTurns().length;
     const mounted = document.querySelectorAll(TURN_SELECTOR + ' [data-message-author-role]').length;
     setSessionRow('turns', mounted + ' / ' + total);
@@ -2252,7 +2326,7 @@
       const base = {
         heapUsed: mem ? mem.usedJSHeapSize : null,
         heapTotal: mem ? mem.totalJSHeapSize : null,
-        domNodes: document.getElementsByTagName('*').length,
+        domNodes: null,
         turnsTotal: total,
         turnsMounted: mounted,
         lastClean: null
@@ -2273,6 +2347,7 @@
     log('Initializing...');
 
     await loadStoredState();
+    startGenerationMonitor();
 
     // Complete the freed-memory stat if we just came back from a Clean Memory
     // reload, and restore any draft saved before that reload.

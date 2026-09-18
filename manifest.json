@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "__MSG_extName__",
   "description": "__MSG_extDescription__",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Kyne0328",
   "homepage_url": "https://github.com/Kyne0328/chatgpt-performance-optimizer-web-extension",
   "default_locale": "en",
@@ -26,22 +26,51 @@
   },
   "content_scripts": [
     {
-      "css": ["content.css", "features.css"],
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "css": [
+        "content.css",
+        "features.css"
+      ],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
       "run_at": "document_start"
     },
     {
-      "js": ["shared/i18n-data.js", "content.js", "features.js", "features-keyboard.js"],
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": [
+        "shared/i18n-data.js",
+        "content.js",
+        "features.js",
+        "features-keyboard.js"
+      ],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
       "run_at": "document_end"
     }
   ],
-  "host_permissions": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
   "optional_host_permissions": [
     "*://*.browser-intake-datadoghq.com/*",
     "*://*.datadoghq.com/*",
     "*://*.google-analytics.com/*",
     "*://*.doubleclick.net/*"
   ],
-  "permissions": ["storage", "activeTab", "declarativeNetRequestWithHostAccess"]
+  "permissions": [
+    "storage",
+    "activeTab",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "commands": {
+    "rescue-chat": {
+      "suggested_key": {
+        "default": "Alt+Shift+R"
+      },
+      "description": "Open the current ChatGPT conversation in a fresh tab"
+    }
+  }
 }

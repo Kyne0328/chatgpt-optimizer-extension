@@ -14,8 +14,9 @@
   const KEYS = Object.keys(DEFAULTS);
   const THRESHOLD = { conservative:86, balanced:76, aggressive:62 };
   let prefs = {...DEFAULTS}, baseline = null, lastHealth = null, palette = null, matches = [];
-  let longTasks = [], healthTimer = null, routeTimer = null, navObserver = null, navRefreshTimer = null;
-  let navRefreshRunning = false, navRefreshPending = false, routeKey = convoKey(), notice = null;
+  let longTasks = [], healthLongTaskObs = null, healthTimer = null, routeTimer = null, navRefreshTimer = null;
+  let navRefreshRunning = false, navRefreshPending = false, generationBusy = document.documentElement.hasAttribute('data-relai-generating');
+  let routeKey = convoKey(), notice = null;
 
   const turns = () => [...document.querySelectorAll(TURN)];
   const users = () => [...document.querySelectorAll(USER)];
@@ -40,9 +41,9 @@
   function search(q){ q=String(q||'').trim().toLowerCase(); if(q.length<2){ matches=[]; refreshNav(); return []; } const out=[]; turns().forEach((el,i)=>{ const txt=textOf(el), p=txt.toLowerCase().indexOf(q); if(p<0) return; out.push({key:turnKey(el,i),index:i,role:roleOf(el),label:short(txt.slice(Math.max(0,p-28),p+q.length+72),112),el}); }); matches=out.slice(0,80); refreshNav(); return out.slice(0,30); }
   function outline(){ return users().map((el,i)=>({key:turnKey(el,i),index:i,label:short(textOf(el),105),el})); }
 
-  function observeLongTasks(){ if(typeof PerformanceObserver==='undefined'||!PerformanceObserver.supportedEntryTypes?.includes('longtask')) return; try{ new PerformanceObserver(list=>{ const now=performance.now(); list.getEntries().forEach(e=>longTasks.push({t:now,d:e.duration})); longTasks=longTasks.filter(x=>x.t>now-60000); }).observe({type:'longtask',buffered:true}); }catch{} }
-  function metrics(){ const now=performance.now(); longTasks=longTasks.filter(x=>x.t>now-60000); const m=performance.memory; return {heapBytes:m?.usedJSHeapSize||null,domNodes:document.getElementsByTagName('*').length,turns:turns().length,renderedTurns:document.querySelectorAll(`${TURN} [data-message-author-role]`).length,longTaskCount60s:longTasks.length,longTaskMs60s:Math.round(longTasks.reduce((s,x)=>s+x.d,0)),tabAgeMinutes:Math.round(now/60000)}; }
-  function health(){ const m=metrics(); if(!baseline) baseline={...m}; let s=0, mb=(m.heapBytes||0)/1048576; s+=mb>=700?45:mb>=500?34:mb>=350?22:mb>=250?10:0; s+=m.domNodes>=30000?30:m.domNodes>=20000?23:m.domNodes>=12000?15:m.domNodes>=7000?7:0; s+=m.turns>=300?20:m.turns>=180?14:m.turns>=100?8:m.turns>=50?4:0; s+=m.longTaskCount60s>=20?15:m.longTaskCount60s>=10?10:m.longTaskCount60s>=5?5:0; s=Math.min(100,s); const label=s>=76?'Critical':s>=55?'Heavy':s>=30?'Moderate':'Good'; return lastHealth={score:s,label,metrics:m,baseline,delta:{heapBytes:m.heapBytes!=null&&baseline.heapBytes!=null?m.heapBytes-baseline.heapBytes:null,domNodes:m.domNodes-baseline.domNodes}}; }
+  function observeLongTasks(){ if(healthLongTaskObs||typeof PerformanceObserver==='undefined'||!PerformanceObserver.supportedEntryTypes?.includes('longtask')) return; try{ healthLongTaskObs=new PerformanceObserver(list=>{ const now=performance.now(); list.getEntries().forEach(e=>longTasks.push({t:now,d:e.duration})); longTasks=longTasks.filter(x=>x.t>now-60000); }); healthLongTaskObs.observe({type:'longtask',buffered:true}); }catch{ healthLongTaskObs=null; } }
+  function metrics(){ const now=performance.now(); longTasks=longTasks.filter(x=>x.t>now-60000); const m=performance.memory; return {heapBytes:m?.usedJSHeapSize||null,domNodes:null,turns:turns().length,renderedTurns:document.querySelectorAll(`${TURN} [data-message-author-role]`).length,longTaskCount60s:longTasks.length,longTaskMs60s:Math.round(longTasks.reduce((sum,x)=>sum+x.d,0)),tabAgeMinutes:Math.round(now/60000)}; }
+  function health(){ const m=metrics(); if(!baseline) baseline={...m}; let s=0, mb=(m.heapBytes||0)/1048576; s+=mb>=700?45:mb>=500?34:mb>=350?22:mb>=250?10:0; s+=m.turns>=300?20:m.turns>=180?14:m.turns>=100?8:m.turns>=50?4:0; s+=m.longTaskCount60s>=20?15:m.longTaskCount60s>=10?10:m.longTaskCount60s>=5?5:0; s=Math.min(100,s); const label=s>=76?'Critical':s>=55?'Heavy':s>=30?'Moderate':'Good'; return lastHealth={score:s,label,metrics:m,baseline,delta:{heapBytes:m.heapBytes!=null&&baseline.heapBytes!=null?m.heapBytes-baseline.heapBytes:null,domNodes:null}}; }
   function hasDraft(){ const t=document.querySelector('textarea'); if(t?.value.trim()) return true; const e=document.querySelector('[contenteditable="true"]'); return !!e?.innerText?.trim(); }
   function streaming(){ return !!document.querySelector('[data-testid="stop-button"],button[aria-label*="Stop" i],.result-streaming'); }
   function reset(auto=false){ try{ sessionStorage.setItem(auto?'relaiAutoResetAt':'relaiManualResetAt',String(Date.now())); }catch{} location.reload(); }
@@ -51,19 +52,9 @@
   function tickHealth(){ const h=health(); let ignore=0,last=0; try{ignore=Number(sessionStorage.getItem('relaiHealthIgnoreUntil')||0);last=Number(sessionStorage.getItem('relaiAutoResetAt')||0);}catch{} if(Date.now()<ignore) return; const auto=prefs.sessionAutoManage&&h.score>=(THRESHOLD[prefs.sessionAutoMode]||76)&&Date.now()-last>900000; if(auto) warn(h,true); else if(prefs.sessionHealthWarnings&&h.score>=76) warn(h,false); else if(h.score<55) removeNotice(); }
 
   function scheduleNavRefresh(delay=120){
+    if(generationBusy) return;
     if(navRefreshTimer) clearTimeout(navRefreshTimer);
     navRefreshTimer=setTimeout(()=>{ navRefreshTimer=null; refreshNav(); },delay);
-  }
-  function mutationTouchesNavState(mutations){
-    const nav=document.getElementById('relai-nav');
-    for(const m of mutations){
-      if(nav&&(m.target===nav||nav.contains(m.target))) continue;
-      for(const node of [...m.addedNodes,...m.removedNodes]){
-        if(node.nodeType!==Node.ELEMENT_NODE) continue;
-        if(node.id==='relai-nav'||node.matches?.(USER)||node.querySelector?.(USER)) return true;
-      }
-    }
-    return false;
   }
   async function refreshNav(){
     if(navRefreshRunning){ navRefreshPending=true; return; }
@@ -110,10 +101,21 @@
       if(navRefreshPending){ navRefreshPending=false; scheduleNavRefresh(0); }
     }
   }
+  function onTurnsChanged(){ scheduleNavRefresh(); }
+  function onNavMounted(){ scheduleNavRefresh(0); }
+  function onGenerationStart(){
+    generationBusy=true;
+    if(navRefreshTimer){ clearTimeout(navRefreshTimer); navRefreshTimer=null; }
+  }
+  function onGenerationEnd(){
+    generationBusy=false;
+    scheduleNavRefresh(200);
+  }
   function watchNav(){
-    if(navObserver) navObserver.disconnect();
-    navObserver=new MutationObserver((mutations)=>{ if(mutationTouchesNavState(mutations)) scheduleNavRefresh(); });
-    navObserver.observe(document.documentElement,{childList:true,subtree:true});
+    document.addEventListener('relai-turns-changed',onTurnsChanged);
+    document.addEventListener('relai-nav-mounted',onNavMounted);
+    document.addEventListener('relai-generation-start',onGenerationStart);
+    document.addEventListener('relai-generation-end',onGenerationEnd);
     scheduleNavRefresh(0);
   }
 
@@ -125,13 +127,13 @@
   function closePalette(){ if(palette) palette.hidden=true; matches=[]; refreshNav(); }
   async function showBookmarks(){ const list=await bookmarks(), u=users(), root=createPalette(), box=root.querySelector('.relai-palette-results'); root.querySelector('.relai-palette-meta').textContent=`${list.length} bookmarks`; box.textContent=''; list.forEach(b=>{const el=u.find((n,i)=>turnKey(n,i)===b.key)||u[b.index]; if(!el) return; const row=document.createElement('button');row.className='relai-palette-row';row.innerHTML='<strong></strong><small></small>';row.querySelector('strong').textContent=b.label;row.querySelector('small').textContent=`Prompt ${b.index+1}`;row.onclick=()=>{scrollTo(el);closePalette()};box.appendChild(row)}); }
   function showOutline(){ const root=createPalette(),box=root.querySelector('.relai-palette-results'),out=outline(); root.querySelector('.relai-palette-meta').textContent=`${out.length} prompts`; box.textContent=''; out.forEach(x=>{const row=document.createElement('button');row.className='relai-palette-row';row.innerHTML='<strong></strong><small></small>';row.querySelector('strong').textContent=x.label;row.querySelector('small').textContent=`Prompt ${x.index+1}`;row.onclick=()=>{scrollTo(x.el);closePalette()};box.appendChild(row)}); }
-  function showHealth(){ const h=health(),root=createPalette(),box=root.querySelector('.relai-palette-results'); root.querySelector('.relai-palette-meta').textContent='Local measurements; score is a heuristic'; box.innerHTML=`<div class="relai-palette-row"><strong>${h.label} · ${h.score}/100</strong><small>Heap ${h.metrics.heapBytes?Math.round(h.metrics.heapBytes/1048576)+' MB':'unavailable'} · DOM ${h.metrics.domNodes.toLocaleString()} · ${h.metrics.turns} turns · ${h.metrics.longTaskCount60s} long tasks/60s</small></div>`; }
+  function showHealth(){ const h=health(),root=createPalette(),box=root.querySelector('.relai-palette-results'); root.querySelector('.relai-palette-meta').textContent='Local measurements; score is a heuristic'; box.innerHTML=`<div class="relai-palette-row"><strong>${h.label} · ${h.score}/100</strong><small>Heap ${h.metrics.heapBytes?Math.round(h.metrics.heapBytes/1048576)+' MB':'unavailable'} · ${h.metrics.turns} turns · ${h.metrics.longTaskCount60s} long tasks/60s</small></div>`; }
   function showCompat(){ const root=createPalette(),box=root.querySelector('.relai-palette-results'),r=compat(); root.querySelector('.relai-palette-meta').textContent='Compatibility checks'; box.textContent=''; Object.entries(r).forEach(([k,v])=>{const el=document.createElement('div');el.className='relai-palette-row';el.innerHTML='<strong></strong><small></small>';el.querySelector('strong').textContent=`${k}: ${v.status.toUpperCase()}`;el.querySelector('small').textContent=v.detail;box.appendChild(el)}); }
 
   chrome.runtime.onMessage.addListener((msg,_s,reply)=>{ if(!msg?.action?.startsWith?.('RELAI_')) return; if(msg.action==='RELAI_FEATURES_STATUS'){ Promise.all([bookmarks(),loadPrefs()]).then(([b])=>reply({success:true,health:health(),bookmarks:b.length,focusMode:document.documentElement.classList.contains('relai-focus-mode'),prefs:{...prefs},compatibility:compat()})); return true; } if(msg.action==='RELAI_OPEN_PALETTE'){reply({success:openPalette()});return;} if(msg.action==='RELAI_TOGGLE_BOOKMARK'){toggleBookmark().then(reply);return true;} if(msg.action==='RELAI_SET_FOCUS'){document.documentElement.classList.toggle('relai-focus-mode',!!msg.enabled);chrome.storage.local.set({focusModeEnabled:!!msg.enabled});prefs.focusModeEnabled=!!msg.enabled;reply({success:true});return;} if(msg.action==='RELAI_RUN_COMPAT'){reply({success:true,report:compat()});return;} if(msg.action==='RELAI_RESET_NOW'){reply({success:true});setTimeout(()=>reset(false),50);return;} });
   chrome.storage.onChanged.addListener((c,a)=>{ if(a!=='local')return; let navChanged='relaiBookmarks' in c; KEYS.forEach(k=>{if(k in c&&typeof c[k].newValue===typeof DEFAULTS[k]){prefs[k]=c[k].newValue;navChanged=true;}}); document.documentElement.classList.toggle('relai-focus-mode',!!prefs.focusModeEnabled); if(navChanged) scheduleNavRefresh(0); });
   document.addEventListener('keydown',e=>{ if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key.toLowerCase()==='k'&&prefs.commandPaletteEnabled){e.preventDefault();palette&&!palette.hidden?closePalette():openPalette();}},true);
 
-  async function init(){ await loadPrefs(); observeLongTasks(); watchNav(); baseline=metrics(); healthTimer=setInterval(()=>{if(!document.hidden)tickHealth()},15000); routeTimer=setInterval(()=>{const k=convoKey();if(k!==routeKey){routeKey=k;baseline=metrics();matches=[];removeNotice();scheduleNavRefresh(0)}},1500); window.addEventListener('pagehide',()=>{ if(navObserver){navObserver.disconnect();navObserver=null;} if(navRefreshTimer){clearTimeout(navRefreshTimer);navRefreshTimer=null;} if(healthTimer){clearInterval(healthTimer);healthTimer=null;} if(routeTimer){clearInterval(routeTimer);routeTimer=null;} },{once:true}); }
+  async function init(){ await loadPrefs(); observeLongTasks(); watchNav(); baseline=metrics(); healthTimer=setInterval(()=>{if(!document.hidden&&!generationBusy)tickHealth()},30000); routeTimer=setInterval(()=>{const k=convoKey();if(k!==routeKey){routeKey=k;baseline=metrics();matches=[];removeNotice();scheduleNavRefresh(0)}},1500); window.addEventListener('pagehide',()=>{ document.removeEventListener('relai-turns-changed',onTurnsChanged); document.removeEventListener('relai-nav-mounted',onNavMounted); document.removeEventListener('relai-generation-start',onGenerationStart); document.removeEventListener('relai-generation-end',onGenerationEnd); if(navRefreshTimer){clearTimeout(navRefreshTimer);navRefreshTimer=null;} if(healthTimer){clearInterval(healthTimer);healthTimer=null;} if(routeTimer){clearInterval(routeTimer);routeTimer=null;} if(healthLongTaskObs){try{healthLongTaskObs.disconnect()}catch{} healthLongTaskObs=null;} },{once:true}); }
   init().catch(e=>console.warn('[Rel.AI Companion] Feature layer failed',e?.message||e));
 })();
