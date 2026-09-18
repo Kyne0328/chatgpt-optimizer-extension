@@ -15,6 +15,8 @@
   let initTimeout = null;
   let isInitialized = false;
   let styleTag = null;
+  let waitForTurnsObs = null;
+  let waitForTurnsTimer = null;
 
   // ── Constants ─────────────────────────────────────────────────────
   const TURN_SELECTOR = '[data-testid^="conversation-turn-"]';
@@ -78,11 +80,13 @@
     return styleTag;
   }
 
-  // ChatGPT handles turn virtualization. Rel.AI keeps every turn visible and
-  // uses Clean Memory only for deliberate full reloads between conversations.
+  // Do not override ChatGPT's turn visibility. Its native virtualization is
+  // essential on long conversations; forcing every historical turn visible can
+  // turn an end-of-response render into a main-thread stall.
   function applyVisibility() {
     totalTurns = getTurns().length;
-    ensureStyleTag().textContent = TURN_SELECTOR + ' { display: revert !important; }';
+    const tag = document.getElementById(VISIBILITY_STYLE_ID);
+    if (tag) tag.textContent = '';
   }
 
 
@@ -221,12 +225,18 @@
     return path === '/' || path === '' || !path.startsWith('/c/');
   }
 
+  function cancelWaitForTurns() {
+    if (waitForTurnsObs) { waitForTurnsObs.disconnect(); waitForTurnsObs = null; }
+    if (waitForTurnsTimer) { clearTimeout(waitForTurnsTimer); waitForTurnsTimer = null; }
+  }
+
   function waitForTurns() {
+    cancelWaitForTurns();
+
     // New/empty chat — no turns expected, don't show loading
     if (isNewChatPage()) {
       log('New chat page, no turns to wait for');
       removeLoadingIndicator();
-      ensureStyleTag().textContent = TURN_SELECTOR + ' { display: revert !important; }';
       return;
     }
 
@@ -237,25 +247,36 @@
     }
 
     log('Waiting for turns...');
-    const obs = new MutationObserver(() => {
+    waitForTurnsObs = new MutationObserver((mutations) => {
+      let hasTurn = false;
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node.nodeType === Node.ELEMENT_NODE &&
+              (node.matches?.(TURN_SELECTOR) || node.querySelector?.(TURN_SELECTOR))) {
+            hasTurn = true;
+            break;
+          }
+        }
+        if (hasTurn) break;
+      }
+      if (!hasTurn) return;
       const turns = getTurns();
       if (turns.length > 0) {
-        obs.disconnect();
+        cancelWaitForTurns();
         log('Turns detected! (' + turns.length + ')');
         init();
       }
     });
 
-    const target = document.querySelector('main') || document.body;
-    obs.observe(target, { childList: true, subtree: true });
+    const target = document.querySelector('main') || document.body || document.documentElement;
+    waitForTurnsObs.observe(target, { childList: true, subtree: true });
 
     // Safety timeout: if no turns after 15s, clear loading
-    setTimeout(() => {
-      obs.disconnect();
+    waitForTurnsTimer = setTimeout(() => {
+      cancelWaitForTurns();
       if (!isInitialized) {
         log('Timeout, clearing loading state');
         removeLoadingIndicator();
-        ensureStyleTag().textContent = TURN_SELECTOR + ' { display: revert !important; }';
       }
     }, 15000);
   }
@@ -287,9 +308,9 @@
   const PERF_DEFAULTS = {
     perfResourceHints: true,
     perfReduceAnim: true,
-    perfOptimizeDom: true,
+    perfOptimizeDom: false,
     perfFontSwap: true,
-    perfLazyImg: true,
+    perfLazyImg: false,
     perfBlockTrackers: false,
     perfKeepSession: false,
     perfDeferScripts: false
@@ -1345,6 +1366,7 @@
 
   function teardown() {
     removeLoadingIndicator();
+    cancelWaitForTurns();
     // Different chat → clear all selection state (testIds won't match)
     if (selectionMode) toggleSelectionMode(false);
     selectedIds.clear();
@@ -1412,7 +1434,7 @@
     setupMutationObserver();
     isInitialized = true;
 
-    // Always reveal every turn — ChatGPT virtualizes off-screen on its own.
+    // Preserve ChatGPT's native long-conversation virtualization.
     applyVisibility();
 
     // Rebind per-chat listeners for tools (Navigator scroll, scans).
@@ -1534,10 +1556,23 @@
     if (toolActive.hideThinking) scanHideThinking();
     if (toolActive.clickToLoadImg) scanClickToLoadImg();
   }
+  function mutationAffectsToolScan(mutations) {
+    const needsDeepTurnChanges = toolActive.hideThinking || toolActive.clickToLoadImg;
+    for (const m of mutations) {
+      if (needsDeepTurnChanges && m.target?.nodeType === Node.ELEMENT_NODE && m.target.closest?.(TURN_SELECTOR)) return true;
+      for (const node of [...m.addedNodes, ...m.removedNodes]) {
+        if (node.nodeType !== Node.ELEMENT_NODE) continue;
+        if (node.matches?.(TURN_SELECTOR) || node.querySelector?.(TURN_SELECTOR)) return true;
+      }
+    }
+    return false;
+  }
   function updateToolScanObserver() {
     if (toolScanNeeded()) {
       if (!toolScanObs) {
-        toolScanObs = new MutationObserver(scheduleToolScan);
+        toolScanObs = new MutationObserver((mutations) => {
+          if (mutationAffectsToolScan(mutations)) scheduleToolScan();
+        });
         toolScanObs.observe(document.body || document.documentElement, { childList: true, subtree: true });
       }
       runToolScan(); // immediate pass so toggling takes effect at once

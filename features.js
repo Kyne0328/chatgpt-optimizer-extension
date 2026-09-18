@@ -14,7 +14,8 @@
   const KEYS = Object.keys(DEFAULTS);
   const THRESHOLD = { conservative:86, balanced:76, aggressive:62 };
   let prefs = {...DEFAULTS}, baseline = null, lastHealth = null, palette = null, matches = [];
-  let longTasks = [], healthTimer = null, navObserver = null, routeKey = convoKey(), notice = null;
+  let longTasks = [], healthTimer = null, routeTimer = null, navObserver = null, navRefreshTimer = null;
+  let navRefreshRunning = false, navRefreshPending = false, routeKey = convoKey(), notice = null;
 
   const turns = () => [...document.querySelectorAll(TURN)];
   const users = () => [...document.querySelectorAll(USER)];
@@ -49,9 +50,72 @@
   function warn(h,auto=false){ if(notice||hasDraft()||streaming()) return; const n=document.createElement('div'); n.className='relai-health-notice'; theme(n); n.innerHTML=`<strong>Session health: ${h.label}</strong><span>${auto?'This tab is under heavy load. Memory Reset will reload it in 8 seconds.':'This tab is under heavy load. You can reload the current conversation to release accumulated resources.'}</span><div class="relai-health-actions"><button type="button">Reset now</button><button type="button">${auto?'Cancel':'Ignore'}</button></div>`; const [go,no]=n.querySelectorAll('button'); go.onclick=()=>reset(auto); no.onclick=()=>{ try{sessionStorage.setItem('relaiHealthIgnoreUntil',String(Date.now()+600000));}catch{} removeNotice(); }; document.body.appendChild(n); notice=n; if(auto) setTimeout(()=>{ if(notice===n) reset(true); },8000); }
   function tickHealth(){ const h=health(); let ignore=0,last=0; try{ignore=Number(sessionStorage.getItem('relaiHealthIgnoreUntil')||0);last=Number(sessionStorage.getItem('relaiAutoResetAt')||0);}catch{} if(Date.now()<ignore) return; const auto=prefs.sessionAutoManage&&h.score>=(THRESHOLD[prefs.sessionAutoMode]||76)&&Date.now()-last>900000; if(auto) warn(h,true); else if(prefs.sessionHealthWarnings&&h.score>=76) warn(h,false); else if(h.score<55) removeNotice(); }
 
-  async function refreshNav(){ const nav=document.getElementById('relai-nav'); if(!nav) return; if(!nav.dataset.relaiEnhanced){ nav.dataset.relaiEnhanced='1'; const markers=document.createElement('div'); markers.className='relai-nav-markers'; nav.appendChild(markers); const preview=document.createElement('div'); preview.className='relai-nav-preview'; preview.hidden=true; nav.appendChild(preview); nav.addEventListener('pointermove',e=>{ if(!prefs.navigatorPreviewsEnabled) return; const u=users(), track=nav.querySelector('.relai-nav-track'); if(!u.length||!track) return; const r=track.getBoundingClientRect(), ratio=Math.max(0,Math.min(1,(e.clientY-r.top)/Math.max(1,r.height))), i=Math.round(ratio*(u.length-1)); preview.textContent=`${i+1} / ${u.length} · ${short(textOf(u[i]),76)}`; preview.style.top=`${Math.max(8,Math.min(92,ratio*100))}%`; preview.hidden=false; }); nav.addEventListener('pointerleave',()=>preview.hidden=true); }
-    const box=nav.querySelector('.relai-nav-markers'); if(!box) return; box.textContent=''; const preview=nav.querySelector('.relai-nav-preview'); if(!prefs.navigatorPreviewsEnabled){ if(preview) preview.hidden=true; return; } const u=users(); if(u.length<2) return; const b=new Set((await bookmarks()).map(x=>x.key)), s=new Set(matches.map(x=>x.key)); u.forEach((el,i)=>{ const key=turnKey(el,i); if(!b.has(key)&&!s.has(key)) return; const m=document.createElement('button'); m.type='button'; m.className=`relai-nav-marker${b.has(key)?' relai-nav-marker-bookmark':''}${s.has(key)?' relai-nav-marker-search':''}`; m.style.top=`${i/Math.max(1,u.length-1)*100}%`; m.onclick=e=>{e.stopPropagation();scrollTo(el)}; box.appendChild(m); }); }
-  function watchNav(){ navObserver=new MutationObserver(()=>{ if(document.getElementById('relai-nav')) refreshNav(); }); navObserver.observe(document.documentElement,{childList:true,subtree:true}); refreshNav(); }
+  function scheduleNavRefresh(delay=120){
+    if(navRefreshTimer) clearTimeout(navRefreshTimer);
+    navRefreshTimer=setTimeout(()=>{ navRefreshTimer=null; refreshNav(); },delay);
+  }
+  function mutationTouchesNavState(mutations){
+    const nav=document.getElementById('relai-nav');
+    for(const m of mutations){
+      if(nav&&(m.target===nav||nav.contains(m.target))) continue;
+      for(const node of [...m.addedNodes,...m.removedNodes]){
+        if(node.nodeType!==Node.ELEMENT_NODE) continue;
+        if(node.id==='relai-nav'||node.matches?.(USER)||node.querySelector?.(USER)) return true;
+      }
+    }
+    return false;
+  }
+  async function refreshNav(){
+    if(navRefreshRunning){ navRefreshPending=true; return; }
+    navRefreshRunning=true;
+    try{
+      const nav=document.getElementById('relai-nav');
+      if(!nav) return;
+      if(!nav.dataset.relaiEnhanced){
+        nav.dataset.relaiEnhanced='1';
+        const markers=document.createElement('div'); markers.className='relai-nav-markers'; nav.appendChild(markers);
+        const preview=document.createElement('div'); preview.className='relai-nav-preview'; preview.hidden=true; nav.appendChild(preview);
+        nav.addEventListener('pointermove',e=>{ if(!prefs.navigatorPreviewsEnabled) return; const u=users(), track=nav.querySelector('.relai-nav-track'); if(!u.length||!track) return; const r=track.getBoundingClientRect(), ratio=Math.max(0,Math.min(1,(e.clientY-r.top)/Math.max(1,r.height))), i=Math.round(ratio*(u.length-1)); preview.textContent=`${i+1} / ${u.length} · ${short(textOf(u[i]),76)}`; preview.style.top=`${Math.max(8,Math.min(92,ratio*100))}%`; preview.hidden=false; });
+        nav.addEventListener('pointerleave',()=>preview.hidden=true);
+      }
+      const box=nav.querySelector('.relai-nav-markers');
+      if(!box) return;
+      const preview=nav.querySelector('.relai-nav-preview');
+      if(!prefs.navigatorPreviewsEnabled){
+        if(preview) preview.hidden=true;
+        if(box.dataset.relaiSignature!=='off'){ box.replaceChildren(); box.dataset.relaiSignature='off'; }
+        return;
+      }
+      const u=users();
+      if(u.length<2){
+        const signature=`empty:${u.length}`;
+        if(box.dataset.relaiSignature!==signature){ box.replaceChildren(); box.dataset.relaiSignature=signature; }
+        return;
+      }
+      let saved=[];
+      try{ saved=await bookmarks(); }
+      catch(e){ console.warn('[Rel.AI Companion] Navigator bookmarks unavailable',e?.message||e); }
+      const b=new Set(saved.map(x=>x.key)), s=new Set(matches.map(x=>x.key)), markerRows=[];
+      u.forEach((el,i)=>{ const key=turnKey(el,i), bookmarked=b.has(key), searched=s.has(key); if(bookmarked||searched) markerRows.push({el,i,key,bookmarked,searched}); });
+      const signature=`${u.length}|`+markerRows.map(x=>`${x.i}:${x.key}:${x.bookmarked?'b':''}${x.searched?'s':''}`).join('|');
+      if(box.dataset.relaiSignature===signature) return;
+      const frag=document.createDocumentFragment();
+      markerRows.forEach(x=>{ const m=document.createElement('button'); m.type='button'; m.className=`relai-nav-marker${x.bookmarked?' relai-nav-marker-bookmark':''}${x.searched?' relai-nav-marker-search':''}`; m.style.top=`${x.i/Math.max(1,u.length-1)*100}%`; m.onclick=e=>{e.stopPropagation();scrollTo(x.el)}; frag.appendChild(m); });
+      box.replaceChildren(frag);
+      box.dataset.relaiSignature=signature;
+    }catch(e){
+      console.warn('[Rel.AI Companion] Navigator refresh failed',e?.message||e);
+    }finally{
+      navRefreshRunning=false;
+      if(navRefreshPending){ navRefreshPending=false; scheduleNavRefresh(0); }
+    }
+  }
+  function watchNav(){
+    if(navObserver) navObserver.disconnect();
+    navObserver=new MutationObserver((mutations)=>{ if(mutationTouchesNavState(mutations)) scheduleNavRefresh(); });
+    navObserver.observe(document.documentElement,{childList:true,subtree:true});
+    scheduleNavRefresh(0);
+  }
 
   function compat(){ const ts=turns(), us=users(); const spec=typeof HTMLScriptElement.supports==='function'&&HTMLScriptElement.supports('speculationrules'); const lt=PerformanceObserver?.supportedEntryTypes?.includes?.('longtask'); return {turns:{status:ts.length?'ok':'warn',detail:ts.length?`${ts.length} turns detected`:'No turns detected yet'},userTurns:{status:us.length?'ok':'warn',detail:us.length?`${us.length} user turns detected`:'No user turns detected yet'},composer:{status:document.querySelector('textarea,[contenteditable="true"]')?'ok':'warn',detail:'Composer selector check'},navigator:{status:document.getElementById('relai-nav')?'ok':'info',detail:document.getElementById('relai-nav')?'Conversation rail mounted':'Rail disabled or conversation too short'},memory:{status:performance.memory?'ok':'info',detail:performance.memory?'JS heap metrics available':'JS heap metrics unavailable'},longTasks:{status:lt?'ok':'info',detail:lt?'Long-task metrics available':'Long-task metrics unavailable'},quickOpen:{status:spec?'ok':'info',detail:spec?'Speculation Rules supported; Chromium still decides whether to prerender':'Speculation Rules unsupported'},sessionCheck:{status:'info',detail:'Session Check is experimental; login extension is not asserted'}}; }
 
@@ -65,9 +129,9 @@
   function showCompat(){ const root=createPalette(),box=root.querySelector('.relai-palette-results'),r=compat(); root.querySelector('.relai-palette-meta').textContent='Compatibility checks'; box.textContent=''; Object.entries(r).forEach(([k,v])=>{const el=document.createElement('div');el.className='relai-palette-row';el.innerHTML='<strong></strong><small></small>';el.querySelector('strong').textContent=`${k}: ${v.status.toUpperCase()}`;el.querySelector('small').textContent=v.detail;box.appendChild(el)}); }
 
   chrome.runtime.onMessage.addListener((msg,_s,reply)=>{ if(!msg?.action?.startsWith?.('RELAI_')) return; if(msg.action==='RELAI_FEATURES_STATUS'){ Promise.all([bookmarks(),loadPrefs()]).then(([b])=>reply({success:true,health:health(),bookmarks:b.length,focusMode:document.documentElement.classList.contains('relai-focus-mode'),prefs:{...prefs},compatibility:compat()})); return true; } if(msg.action==='RELAI_OPEN_PALETTE'){reply({success:openPalette()});return;} if(msg.action==='RELAI_TOGGLE_BOOKMARK'){toggleBookmark().then(reply);return true;} if(msg.action==='RELAI_SET_FOCUS'){document.documentElement.classList.toggle('relai-focus-mode',!!msg.enabled);chrome.storage.local.set({focusModeEnabled:!!msg.enabled});prefs.focusModeEnabled=!!msg.enabled;reply({success:true});return;} if(msg.action==='RELAI_RUN_COMPAT'){reply({success:true,report:compat()});return;} if(msg.action==='RELAI_RESET_NOW'){reply({success:true});setTimeout(()=>reset(false),50);return;} });
-  chrome.storage.onChanged.addListener((c,a)=>{ if(a!=='local')return; KEYS.forEach(k=>{if(k in c&&typeof c[k].newValue===typeof DEFAULTS[k])prefs[k]=c[k].newValue}); document.documentElement.classList.toggle('relai-focus-mode',!!prefs.focusModeEnabled); refreshNav(); });
+  chrome.storage.onChanged.addListener((c,a)=>{ if(a!=='local')return; let navChanged='relaiBookmarks' in c; KEYS.forEach(k=>{if(k in c&&typeof c[k].newValue===typeof DEFAULTS[k]){prefs[k]=c[k].newValue;navChanged=true;}}); document.documentElement.classList.toggle('relai-focus-mode',!!prefs.focusModeEnabled); if(navChanged) scheduleNavRefresh(0); });
   document.addEventListener('keydown',e=>{ if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key.toLowerCase()==='k'&&prefs.commandPaletteEnabled){e.preventDefault();palette&&!palette.hidden?closePalette():openPalette();}},true);
 
-  async function init(){ await loadPrefs(); observeLongTasks(); watchNav(); baseline=metrics(); healthTimer=setInterval(()=>{if(!document.hidden)tickHealth()},15000); setInterval(()=>{const k=convoKey();if(k!==routeKey){routeKey=k;baseline=metrics();matches=[];removeNotice();refreshNav()}},1500); }
+  async function init(){ await loadPrefs(); observeLongTasks(); watchNav(); baseline=metrics(); healthTimer=setInterval(()=>{if(!document.hidden)tickHealth()},15000); routeTimer=setInterval(()=>{const k=convoKey();if(k!==routeKey){routeKey=k;baseline=metrics();matches=[];removeNotice();scheduleNavRefresh(0)}},1500); window.addEventListener('pagehide',()=>{ if(navObserver){navObserver.disconnect();navObserver=null;} if(navRefreshTimer){clearTimeout(navRefreshTimer);navRefreshTimer=null;} if(healthTimer){clearInterval(healthTimer);healthTimer=null;} if(routeTimer){clearInterval(routeTimer);routeTimer=null;} },{once:true}); }
   init().catch(e=>console.warn('[Rel.AI Companion] Feature layer failed',e?.message||e));
 })();
