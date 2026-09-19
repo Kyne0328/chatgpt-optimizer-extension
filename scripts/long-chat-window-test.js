@@ -62,6 +62,14 @@ function chain(count) {
   assert.strictEqual(result.payload, malformed);
 }
 
+{
+  const input = chain(220);
+  input.mapping.n0.parent = 'missing-parent';
+  const result = trimConversationPayload(input);
+  assert.strictEqual(result.changed, false);
+  assert.strictEqual(result.reason, 'incomplete_chain');
+}
+
 assert.strictEqual(
   isConversationRequest('https://chatgpt.com/backend-api/conversation/abc', { method: 'GET' }),
   true
