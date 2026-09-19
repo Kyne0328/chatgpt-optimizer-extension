@@ -14,7 +14,7 @@
   const KEYS = Object.keys(DEFAULTS);
   const THRESHOLD = { conservative:86, balanced:76, aggressive:62 };
   let prefs = {...DEFAULTS}, baseline = null, lastHealth = null, palette = null, matches = [];
-  let longTasks = [], healthLongTaskObs = null, healthTimer = null, routeTimer = null, navRefreshTimer = null;
+  let longTasks = [], healthLongTaskObs = null, healthTimer = null, routeTimer = null, navRefreshTimer = null, navRefreshIdle = null;
   let navRefreshRunning = false, navRefreshPending = false, generationBusy = document.documentElement.hasAttribute('data-relai-generating');
   let routeKey = convoKey(), notice = null;
 
@@ -51,10 +51,21 @@
   function warn(h,auto=false){ if(notice||hasDraft()||streaming()) return; const n=document.createElement('div'); n.className='relai-health-notice'; theme(n); n.innerHTML=`<strong>Session health: ${h.label}</strong><span>${auto?'This tab is under heavy load. Memory Reset will reload it in 8 seconds.':'This tab is under heavy load. You can reload the current conversation to release accumulated resources.'}</span><div class="relai-health-actions"><button type="button">Reset now</button><button type="button">${auto?'Cancel':'Ignore'}</button></div>`; const [go,no]=n.querySelectorAll('button'); go.onclick=()=>reset(auto); no.onclick=()=>{ try{sessionStorage.setItem('relaiHealthIgnoreUntil',String(Date.now()+600000));}catch{} removeNotice(); }; document.body.appendChild(n); notice=n; if(auto) setTimeout(()=>{ if(notice===n) reset(true); },8000); }
   function tickHealth(){ const h=health(); let ignore=0,last=0; try{ignore=Number(sessionStorage.getItem('relaiHealthIgnoreUntil')||0);last=Number(sessionStorage.getItem('relaiAutoResetAt')||0);}catch{} if(Date.now()<ignore) return; const auto=prefs.sessionAutoManage&&h.score>=(THRESHOLD[prefs.sessionAutoMode]||76)&&Date.now()-last>900000; if(auto) warn(h,true); else if(prefs.sessionHealthWarnings&&h.score>=76) warn(h,false); else if(h.score<55) removeNotice(); }
 
+  function cancelNavRefresh(){
+    if(navRefreshTimer){ clearTimeout(navRefreshTimer); navRefreshTimer=null; }
+    if(navRefreshIdle!==null&&typeof cancelIdleCallback==='function'){ cancelIdleCallback(navRefreshIdle); navRefreshIdle=null; }
+  }
   function scheduleNavRefresh(delay=120){
     if(generationBusy) return;
-    if(navRefreshTimer) clearTimeout(navRefreshTimer);
-    navRefreshTimer=setTimeout(()=>{ navRefreshTimer=null; refreshNav(); },delay);
+    cancelNavRefresh();
+    navRefreshTimer=setTimeout(()=>{
+      navRefreshTimer=null;
+      if(typeof requestIdleCallback==='function'){
+        navRefreshIdle=requestIdleCallback(()=>{ navRefreshIdle=null; refreshNav(); },{timeout:900});
+      }else{
+        refreshNav();
+      }
+    },delay);
   }
   async function refreshNav(){
     if(navRefreshRunning){ navRefreshPending=true; return; }
@@ -77,15 +88,19 @@
         if(box.dataset.relaiSignature!=='off'){ box.replaceChildren(); box.dataset.relaiSignature='off'; }
         return;
       }
+      let saved=[];
+      try{ saved=await bookmarks(); }
+      catch(e){ console.warn('[Rel.AI Companion] Navigator bookmarks unavailable',e?.message||e); }
+      if(!saved.length&&!matches.length){
+        if(box.dataset.relaiSignature!=='none'){ box.replaceChildren(); box.dataset.relaiSignature='none'; }
+        return;
+      }
       const u=users();
       if(u.length<2){
         const signature=`empty:${u.length}`;
         if(box.dataset.relaiSignature!==signature){ box.replaceChildren(); box.dataset.relaiSignature=signature; }
         return;
       }
-      let saved=[];
-      try{ saved=await bookmarks(); }
-      catch(e){ console.warn('[Rel.AI Companion] Navigator bookmarks unavailable',e?.message||e); }
       const b=new Set(saved.map(x=>x.key)), s=new Set(matches.map(x=>x.key)), markerRows=[];
       u.forEach((el,i)=>{ const key=turnKey(el,i), bookmarked=b.has(key), searched=s.has(key); if(bookmarked||searched) markerRows.push({el,i,key,bookmarked,searched}); });
       const signature=`${u.length}|`+markerRows.map(x=>`${x.i}:${x.key}:${x.bookmarked?'b':''}${x.searched?'s':''}`).join('|');
@@ -105,11 +120,11 @@
   function onNavMounted(){ scheduleNavRefresh(0); }
   function onGenerationStart(){
     generationBusy=true;
-    if(navRefreshTimer){ clearTimeout(navRefreshTimer); navRefreshTimer=null; }
+    cancelNavRefresh();
   }
   function onGenerationEnd(){
     generationBusy=false;
-    scheduleNavRefresh(200);
+    scheduleNavRefresh(600);
   }
   function watchNav(){
     document.addEventListener('relai-turns-changed',onTurnsChanged);

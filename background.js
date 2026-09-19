@@ -12,6 +12,7 @@ const DEFAULT_PREFS = {
   perfBlockTrackers: false,
   perfKeepSession: false,
   perfDeferScripts: false,
+  perfLongChatWindow: false,
   // Workspace tools — read by content.js from GET_PREFS / PREFS_UPDATED.
   navigatorEnabled: true,   // Conversation Navigator rail, ON by default
   hudEnabled: false,        // Session Stats chip
@@ -34,6 +35,63 @@ const PERFORMANCE_SAFETY_MIGRATION = {
 };
 
 // --- Content Script Communication ---
+
+// --- Long-chat client window ----------------------------------------
+//
+// Registered in MAIN world so it can wrap the page's own fetch before a large
+// conversation payload reaches React. Registration is preference-driven and
+// persists across service-worker sleeps. Disabling is fail-safe: current pages
+// are told to stop trimming and future pages no longer load the hook.
+
+const LONG_CHAT_SCRIPT_ID = 'relai-long-chat-window';
+
+async function setLongChatWindowRegistration(enabled) {
+  if (!chrome.scripting?.registerContentScripts) return;
+  try {
+    const current = await chrome.scripting.getRegisteredContentScripts({ ids: [LONG_CHAT_SCRIPT_ID] });
+    const registered = current.length > 0;
+
+    if (enabled && !registered) {
+      await chrome.scripting.registerContentScripts([{
+        id: LONG_CHAT_SCRIPT_ID,
+        matches: ['https://chatgpt.com/*', 'https://chat.openai.com/*'],
+        js: ['main-world-performance.js'],
+        runAt: 'document_start',
+        world: 'MAIN',
+        persistAcrossSessions: true
+      }]);
+    } else if (!enabled && registered) {
+      await chrome.scripting.unregisterContentScripts({ ids: [LONG_CHAT_SCRIPT_ID] });
+    }
+
+    const tabs = await chrome.tabs.query({
+      url: ['https://chatgpt.com/*', 'https://chat.openai.com/*']
+    });
+    for (const tab of tabs) {
+      if (!tab.id) continue;
+      if (enabled) {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: 'MAIN',
+          files: ['main-world-performance.js']
+        }).catch(() => {});
+      } else {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: 'MAIN',
+          func: () => window.__RELAI_LONG_CHAT_WINDOW__?.disable?.()
+        }).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn('[Rel.AI Companion] Long Chat Window registration failed:', err && err.message);
+  }
+}
+
+async function reconcileLongChatWindow() {
+  const stored = await chrome.storage.local.get('perfLongChatWindow');
+  return setLongChatWindowRegistration(stored.perfLongChatWindow === true);
+}
 
 async function notifyContentScript(prefs) {
   const tabs = await chrome.tabs.query({
@@ -89,6 +147,7 @@ async function ensurePreferences() {
 chrome.runtime.onStartup.addListener(() => {
   ensurePreferences().catch(() => {});
   reconcileTrackerBlocking();
+  reconcileLongChatWindow().catch(() => {});
 });
 
 ensurePreferences().catch(() => {});
@@ -415,6 +474,7 @@ chrome.permissions.onRemoved.addListener(() => {
 chrome.runtime.onInstalled.addListener(() => {
   ensurePreferences().catch(() => {});
   reconcileTrackerBlocking();
+  reconcileLongChatWindow().catch(() => {});
 });
 
 // --- Frozen-tab rescue ---
@@ -475,6 +535,9 @@ async function handleMessage(msg) {
       }
       await chrome.storage.local.set(newPrefs);
       await notifyContentScript(newPrefs);
+      if ('perfLongChatWindow' in newPrefs) {
+        await setLongChatWindowRegistration(newPrefs.perfLongChatWindow === true);
+      }
       return { success: true };
     }
 
@@ -527,6 +590,7 @@ async function handleMessage(msg) {
 // Idempotent: reconcile only
 // writes when the desired state differs from the installed one.
 reconcileTrackerBlocking();
+reconcileLongChatWindow().catch(() => {});
 
 // Clear any badge text left by earlier versions. The toolbar icon now stands
 // on its own without an "ON" label.

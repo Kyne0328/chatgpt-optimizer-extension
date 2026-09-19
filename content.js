@@ -1649,6 +1649,7 @@
   // ── Conversation Navigator ────────────────────────────────────────
   let navWidget = null;
   let navIntersectionObs = null;
+  let navObserverRoot = undefined;
   let navUsers = [];
   let navIndexByWrapper = new WeakMap();
   let navCurrentIndex = 0;
@@ -1685,6 +1686,7 @@
 
   function detachNavScroll() {
     if (navIntersectionObs) { navIntersectionObs.disconnect(); navIntersectionObs = null; }
+    navObserverRoot = undefined;
     navUsers = [];
     navIndexByWrapper = new WeakMap();
   }
@@ -1780,48 +1782,69 @@
 
   function attachNavScroll() {
     if (!navWidget || generationBusy) return;
-    if (navIntersectionObs) { navIntersectionObs.disconnect(); navIntersectionObs = null; }
 
-    navUsers = getUserTurns();
-    if (navUsers.length < 2) {
+    const nextUsers = getUserTurns();
+    if (nextUsers.length < 2) {
       navWidget.style.display = 'none';
+      if (navIntersectionObs) { navIntersectionObs.disconnect(); navIntersectionObs = null; }
+      navObserverRoot = undefined;
+      navUsers = nextUsers;
+      navIndexByWrapper = new WeakMap();
       return;
     }
+
     navWidget.style.display = '';
-    navCurrentIndex = Math.max(0, Math.min(navCurrentIndex, navUsers.length - 1));
-    setNavPosition(navCurrentIndex, navUsers.length);
+    navCurrentIndex = Math.max(0, Math.min(navCurrentIndex, nextUsers.length - 1));
+    setNavPosition(navCurrentIndex, nextUsers.length);
+    if (typeof IntersectionObserver !== 'function') {
+      navUsers = nextUsers;
+      return;
+    }
 
-    if (typeof IntersectionObserver !== 'function') return;
-
-    const sc = scrollContainer || findScrollContainer(navUsers[0]);
+    const sc = scrollContainer || findScrollContainer(nextUsers[0]);
     const docScroller = document.scrollingElement || document.documentElement;
     const root = !sc || sc === docScroller || sc === document.documentElement || sc === document.body ? null : sc;
-    navIndexByWrapper = new WeakMap();
+    const prefixStable = navUsers.length <= nextUsers.length &&
+      navUsers.every((turn, index) => turn === nextUsers[index]);
+    const rebuild = !navIntersectionObs || navObserverRoot !== root || !prefixStable;
 
-    navIntersectionObs = new IntersectionObserver((entries) => {
-      if (generationBusy || navDragging) return;
-      let best = null;
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        const index = navIndexByWrapper.get(entry.target);
-        if (typeof index !== 'number') continue;
-        const distance = Math.abs(entry.boundingClientRect.top - 80);
-        if (!best || distance < best.distance) best = { index, distance };
+    if (rebuild) {
+      if (navIntersectionObs) navIntersectionObs.disconnect();
+      navIndexByWrapper = new WeakMap();
+      navObserverRoot = root;
+      navIntersectionObs = new IntersectionObserver((entries) => {
+        if (generationBusy || navDragging) return;
+        let best = null;
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const index = navIndexByWrapper.get(entry.target);
+          if (typeof index !== 'number') continue;
+          const distance = Math.abs(entry.boundingClientRect.top - 80);
+          if (!best || distance < best.distance) best = { index, distance };
+        }
+        if (!best) return;
+        navCurrentIndex = best.index;
+        setNavPosition(navCurrentIndex, navUsers.length);
+      }, {
+        root,
+        rootMargin: '-72px 0px -70% 0px',
+        threshold: [0, 0.01]
+      });
+
+      nextUsers.forEach((turn, index) => {
+        const wrapper = getTurnWrapper(turn);
+        navIndexByWrapper.set(wrapper, index);
+        navIntersectionObs.observe(wrapper);
+      });
+    } else {
+      for (let index = navUsers.length; index < nextUsers.length; index += 1) {
+        const wrapper = getTurnWrapper(nextUsers[index]);
+        navIndexByWrapper.set(wrapper, index);
+        navIntersectionObs.observe(wrapper);
       }
-      if (!best) return;
-      navCurrentIndex = best.index;
-      setNavPosition(navCurrentIndex, navUsers.length);
-    }, {
-      root,
-      rootMargin: '-72px 0px -70% 0px',
-      threshold: [0, 0.01]
-    });
+    }
 
-    navUsers.forEach((turn, index) => {
-      const wrapper = getTurnWrapper(turn);
-      navIndexByWrapper.set(wrapper, index);
-      navIntersectionObs.observe(wrapper);
-    });
+    navUsers = nextUsers;
   }
 
   function refreshNavigator() {
