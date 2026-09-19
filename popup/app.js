@@ -2,12 +2,12 @@
 (() => {
   'use strict';
   const $=id=>document.getElementById(id), runtime=chrome.runtime, store=chrome.storage.local;
-  const BASE={cleanMemoryEnabled:true,hideNotifications:false,perfResourceHints:true,perfReduceAnim:false,perfOptimizeDom:false,perfFontSwap:false,perfLazyImg:false,perfBlockTrackers:false,perfKeepSession:false,perfDeferScripts:false,navigatorEnabled:true,hudEnabled:false,cleanMemorySmart:false,hideThinking:false,clickToLoadImg:false,prefetchNav:false,blockTrackersNet:false};
+  const BASE={cleanMemoryEnabled:true,hideNotifications:false,perfResourceHints:true,perfReduceAnim:false,perfOptimizeDom:false,perfFontSwap:false,perfLazyImg:false,perfBlockTrackers:false,perfKeepSession:false,perfDeferScripts:false,perfLongChatWindow:false,navigatorEnabled:true,hudEnabled:false,cleanMemorySmart:false,hideThinking:false,clickToLoadImg:false,prefetchNav:false,blockTrackersNet:false};
   const FEAT={commandPaletteEnabled:true,navigatorPreviewsEnabled:true,bookmarksEnabled:true,conversationSearchEnabled:true,outlineEnabled:true,focusModeEnabled:false,sessionHealthWarnings:true,sessionAutoManage:false,sessionAutoMode:'balanced'};
   const ORIGINS=['*://*.browser-intake-datadoghq.com/*','*://*.datadoghq.com/*','*://*.google-analytics.com/*','*://*.doubleclick.net/*'];
   const PRESETS={
     balanced:{b:{...BASE},f:{...FEAT}},
-    performance:{b:{...BASE,cleanMemoryEnabled:true,cleanMemorySmart:true,navigatorEnabled:true},f:{...FEAT,sessionHealthWarnings:true,sessionAutoManage:false,sessionAutoMode:'balanced'}},
+    performance:{b:{...BASE,cleanMemoryEnabled:true,cleanMemorySmart:true,navigatorEnabled:true,perfLongChatWindow:true},f:{...FEAT,sessionHealthWarnings:true,sessionAutoManage:false,sessionAutoMode:'balanced'}},
     privacy:{b:{...BASE,hideNotifications:true},f:{...FEAT,sessionHealthWarnings:true,sessionAutoManage:false,sessionAutoMode:'conservative'}},
     minimal:{b:{...BASE,cleanMemoryEnabled:false,perfResourceHints:false,navigatorEnabled:false},f:{...FEAT,navigatorPreviewsEnabled:false,sessionHealthWarnings:false,sessionAutoManage:false,sessionAutoMode:'conservative'}}
   };
