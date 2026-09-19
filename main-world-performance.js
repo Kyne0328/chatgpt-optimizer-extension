@@ -80,6 +80,10 @@
     }
 
     const rootId = chainNewestFirst[chainNewestFirst.length - 1];
+    const rootParent = mapping[rootId]?.parent;
+    if (typeof rootParent === 'string' && rootParent.length) {
+      return { changed: false, payload, reason: 'incomplete_chain' };
+    }
     const recent = chainNewestFirst.slice(0, maxActiveNodes);
     const kept = new Set(recent);
     kept.add(rootId);
