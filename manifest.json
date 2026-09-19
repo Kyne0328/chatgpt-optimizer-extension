@@ -62,6 +62,7 @@
   ],
   "permissions": [
     "storage",
+    "scripting",
     "activeTab",
     "declarativeNetRequestWithHostAccess"
   ],
